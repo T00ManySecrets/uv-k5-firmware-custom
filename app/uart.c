@@ -35,6 +35,7 @@
 #include "driver/uart.h"
 #include "functions.h"
 #include "misc.h"
+#include "radio.h"
 #include "settings.h"
 #include "version.h"
 
@@ -157,7 +158,181 @@ static union
 
 static uint32_t Timestamp;
 static uint16_t gUART_WriteIndex;
-static bool     bIsEncrypted = true;
+static bool     bIsEncrypted  = true;
+static bool     bIsCATCommand = false;
+static char     CAT_Buffer[16];
+static uint8_t  CAT_Length;
+
+// ---- CAT helper functions ----
+
+// Write 'digits' zero-padded decimal digits of 'val' into buf (no null terminator)
+static void cat_fmt_uint(char *buf, uint32_t val, uint8_t digits)
+{
+	buf += digits;
+	while (digits--) {
+		*--buf = (char)('0' + (uint8_t)(val % 10u));
+		val /= 10u;
+	}
+}
+
+// Kenwood CAT mode number <-> firmware modulation
+static uint8_t cat_mod_to_cat(ModulationMode_t m)
+{
+	switch (m) {
+		case MODULATION_USB: return 2;
+		case MODULATION_AM:  return 5;
+		default:             return 4; // FM
+	}
+}
+
+static ModulationMode_t cat_cat_to_mod(uint8_t c)
+{
+	switch (c) {
+		case 2:  return MODULATION_USB;
+		case 5:  return MODULATION_AM;
+		default: return MODULATION_FM;
+	}
+}
+
+// Send plain ASCII reply (no binary framing, no encryption)
+static void cat_reply(const char *s, uint8_t len)
+{
+	UART_Send(s, len);
+}
+
+// Parse 11 ASCII decimal digits starting at s into Hz, returns 0 on bad input
+static uint32_t cat_parse_freq(const char *s)
+{
+	uint32_t hz = 0;
+	for (uint8_t i = 0; i < 11; i++) {
+		if (s[i] < '0' || s[i] > '9')
+			return 0;
+		hz = hz * 10u + (uint32_t)(s[i] - '0');
+	}
+	return hz;
+}
+
+// Set VFO frequency (in 10 Hz units) and trigger retune
+static void cat_set_vfo_freq(uint8_t vfo, uint32_t freq_10hz)
+{
+	gEeprom.VfoInfo[vfo].freq_config_RX.Frequency = freq_10hz;
+	gEeprom.VfoInfo[vfo].freq_config_TX.Frequency = freq_10hz;
+	gEeprom.VfoInfo[vfo].pRX = &gEeprom.VfoInfo[vfo].freq_config_RX;
+	gEeprom.VfoInfo[vfo].pTX = &gEeprom.VfoInfo[vfo].freq_config_TX;
+	gFlagReconfigureVfos  = true;
+	gVfoConfigureMode     = VFO_CONFIGURE;
+}
+
+static void HandleCATCommand(void)
+{
+	const char *cmd = CAT_Buffer;
+	char        buf[40];
+
+	// ID - radio identification (Kenwood TS-480 compatible)
+	if (cmd[0]=='I' && cmd[1]=='D' && cmd[2]=='\0') {
+		cat_reply("ID019;", 6);
+		return;
+	}
+
+	// PS - power status (radio is on by definition)
+	if (cmd[0]=='P' && cmd[1]=='S' && cmd[2]=='\0') {
+		cat_reply("PS1;", 4);
+		return;
+	}
+
+	// AI - auto information (acknowledge, stub)
+	if (cmd[0]=='A' && cmd[1]=='I') {
+		cat_reply("AI0;", 4);
+		return;
+	}
+
+	// RX - return to receive
+	if (cmd[0]=='R' && cmd[1]=='X' && cmd[2]=='\0') {
+		if (gCurrentFunction == FUNCTION_TRANSMIT) {
+			gFlagEndTransmission = true;
+			FUNCTION_Select(FUNCTION_FOREGROUND);
+		}
+		cat_reply("RX0;", 4);
+		return;
+	}
+
+	// TX / TX0 - start transmit
+	if (cmd[0]=='T' && cmd[1]=='X' && (cmd[2]=='\0' || cmd[2]=='0')) {
+		gFlagPrepareTX = true;
+		cat_reply("TX0;", 4);
+		return;
+	}
+
+	// FA - VFO A frequency (11-digit Hz)
+	if (cmd[0]=='F' && cmd[1]=='A') {
+		if (cmd[2]=='\0') {
+			buf[0]='F'; buf[1]='A';
+			cat_fmt_uint(buf+2, gEeprom.VfoInfo[0].pRX->Frequency * 10u, 11);
+			buf[13]=';';
+			cat_reply(buf, 14);
+		} else {
+			uint32_t hz = cat_parse_freq(cmd+2);
+			if (hz)
+				cat_set_vfo_freq(0, hz / 10u);
+		}
+		return;
+	}
+
+	// FB - VFO B frequency (11-digit Hz)
+	if (cmd[0]=='F' && cmd[1]=='B') {
+		if (cmd[2]=='\0') {
+			buf[0]='F'; buf[1]='B';
+			cat_fmt_uint(buf+2, gEeprom.VfoInfo[1].pRX->Frequency * 10u, 11);
+			buf[13]=';';
+			cat_reply(buf, 14);
+		} else {
+			uint32_t hz = cat_parse_freq(cmd+2);
+			if (hz)
+				cat_set_vfo_freq(1, hz / 10u);
+		}
+		return;
+	}
+
+	// MD - mode (1/3=FM, 2=USB, 4=FM, 5=AM)
+	if (cmd[0]=='M' && cmd[1]=='D') {
+		if (cmd[2]=='\0') {
+			buf[0]='M'; buf[1]='D';
+			buf[2]=(char)('0' + cat_mod_to_cat(gTxVfo->Modulation));
+			buf[3]=';';
+			cat_reply(buf, 4);
+		} else {
+			RADIO_SetModulation(cat_cat_to_mod((uint8_t)(cmd[2] - '0')));
+			gFlagReconfigureVfos = true;
+			gVfoConfigureMode    = VFO_CONFIGURE;
+		}
+		return;
+	}
+
+	// IF - current operating information (Kenwood TS-480 format)
+	// IF[11-freq][5-passband][±][5-RIT][RIT-on][XIT-on][2-bank][3-mem][TX][mode][VFO][scan][split][tone];
+	if (cmd[0]=='I' && cmd[1]=='F' && cmd[2]=='\0') {
+		uint8_t mode = cat_mod_to_cat(gTxVfo->Modulation);
+		uint8_t tx   = (gCurrentFunction == FUNCTION_TRANSMIT) ? 1u : 0u;
+		buf[0]='I'; buf[1]='F';
+		cat_fmt_uint(buf+2,  gTxVfo->pRX->Frequency * 10u, 11); // P1 freq
+		buf[13]=' '; buf[14]=' '; buf[15]=' '; buf[16]=' '; buf[17]=' '; // P2 passband
+		buf[18]='+';                                                       // P3 RIT sign
+		buf[19]='0'; buf[20]='0'; buf[21]='0'; buf[22]='0'; buf[23]='0'; // P3 RIT value
+		buf[24]='0';                                                       // P4 RIT off
+		buf[25]='0';                                                       // P5 XIT off
+		buf[26]='0'; buf[27]='0';                                          // P6 bank
+		buf[28]='0'; buf[29]='0'; buf[30]='0';                            // P7 mem ch
+		buf[31]=(char)('0'+tx);                                            // P8 TX/RX
+		buf[32]=(char)('0'+mode);                                          // P9 mode
+		buf[33]='0';                                                       // P10 VFO
+		buf[34]='0';                                                       // P11 scan
+		buf[35]='0';                                                       // P12 split
+		buf[36]='0';                                                       // P13 tone
+		buf[37]=';';
+		cat_reply(buf, 38);
+		return;
+	}
+}
 
 static void SendReply(void *pReply, uint16_t Size)
 {
@@ -481,6 +656,54 @@ bool UART_IsCommandAvailable(void)
 	uint16_t CommandLength;
 	uint16_t DmaLength = DMA_CH0->ST & 0xFFFU;
 
+	bIsCATCommand = false;
+
+	// Skip null bytes left by previous commands
+	while (gUART_WriteIndex != DmaLength && UART_DMA_Buffer[gUART_WriteIndex] == 0)
+		gUART_WriteIndex = DMA_INDEX(gUART_WriteIndex, 1);
+
+	if (gUART_WriteIndex == DmaLength)
+		return false;
+
+	// ASCII CAT command detection: starts with an uppercase letter
+	if (UART_DMA_Buffer[gUART_WriteIndex] >= 'A' && UART_DMA_Buffer[gUART_WriteIndex] <= 'Z')
+	{
+		uint16_t scan   = gUART_WriteIndex;
+		uint8_t  catLen = 0;
+
+		while (scan != DmaLength && catLen <= 13)
+		{
+			uint8_t c = UART_DMA_Buffer[scan];
+			if (c == ';')
+			{
+				if (catLen >= 2)
+				{
+					// Valid — extract command bytes (without ';')
+					uint16_t rd = gUART_WriteIndex;
+					uint8_t  j  = 0;
+					while (rd != scan) {
+						CAT_Buffer[j++] = (char)UART_DMA_Buffer[rd];
+						UART_DMA_Buffer[rd] = 0;
+						rd = DMA_INDEX(rd, 1);
+					}
+					CAT_Buffer[j]    = '\0';
+					CAT_Length       = j;
+					UART_DMA_Buffer[scan] = 0;
+					gUART_WriteIndex = DMA_INDEX(scan, 1);
+					bIsCATCommand    = true;
+					return true;
+				}
+				// Too short — discard
+				gUART_WriteIndex = DMA_INDEX(scan, 1);
+				return false;
+			}
+			catLen++;
+			scan = DMA_INDEX(scan, 1);
+		}
+		// No ';' found yet — wait for more data
+		return false;
+	}
+
 	while (1)
 	{
 		if (gUART_WriteIndex == DmaLength)
@@ -567,6 +790,11 @@ bool UART_IsCommandAvailable(void)
 
 void UART_HandleCommand(void)
 {
+	if (bIsCATCommand) {
+		HandleCATCommand();
+		return;
+	}
+
 	switch (UART_Command.Header.ID)
 	{
 		case 0x0514:
