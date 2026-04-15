@@ -332,6 +332,144 @@ static void HandleCATCommand(void)
 		cat_reply(buf, 38);
 		return;
 	}
+
+	// SM - S-meter / signal strength (0-30 scale, Kenwood SM0XXXX; format)
+	if (cmd[0]=='S' && cmd[1]=='M') {
+		uint16_t rssi = BK4819_ReadRegister(BK4819_REG_67) & 0x01FFu;
+		uint16_t sm   = (rssi > 200u) ? 30u : (uint16_t)((rssi * 30u) / 200u);
+		buf[0]='S'; buf[1]='M'; buf[2]='0';
+		cat_fmt_uint(buf+3, sm, 4);
+		buf[7]=';';
+		cat_reply(buf, 8);
+		return;
+	}
+
+	// FR - select receive VFO (FR0=VFO-A, FR1=VFO-B)
+	if (cmd[0]=='F' && cmd[1]=='R') {
+		if (cmd[2]=='\0') {
+			buf[0]='F'; buf[1]='R';
+			buf[2]=(char)('0' + gEeprom.RX_VFO);
+			buf[3]=';';
+			cat_reply(buf, 4);
+		} else {
+			uint8_t vfo = (uint8_t)(cmd[2] - '0');
+			if (vfo <= 1u) {
+				gEeprom.RX_VFO = vfo;
+				RADIO_SelectVfos();
+				gFlagReconfigureVfos = true;
+				gVfoConfigureMode    = VFO_CONFIGURE;
+			}
+		}
+		return;
+	}
+
+	// FT - select transmit VFO (FT0=VFO-A, FT1=VFO-B)
+	if (cmd[0]=='F' && cmd[1]=='T') {
+		if (cmd[2]=='\0') {
+			buf[0]='F'; buf[1]='T';
+			buf[2]=(char)('0' + gEeprom.TX_VFO);
+			buf[3]=';';
+			cat_reply(buf, 4);
+		} else {
+			uint8_t vfo = (uint8_t)(cmd[2] - '0');
+			if (vfo <= 1u) {
+				gEeprom.TX_VFO = vfo;
+				RADIO_SelectVfos();
+				gFlagReconfigureVfos = true;
+				gVfoConfigureMode    = VFO_CONFIGURE;
+			}
+		}
+		return;
+	}
+
+	// SQ - squelch level (SQ0[0-9]; maps to firmware squelch 0-9)
+	if (cmd[0]=='S' && cmd[1]=='Q') {
+		if (cmd[2]=='\0' || cmd[2]=='0') {
+			if (cmd[2]=='\0' || cmd[3]=='\0') {
+				// read
+				buf[0]='S'; buf[1]='Q'; buf[2]='0';
+				buf[3]=(char)('0' + (gEeprom.SQUELCH_LEVEL & 0x0Fu));
+				buf[4]=';';
+				cat_reply(buf, 5);
+			} else {
+				// write: SQ0[digit]
+				uint8_t level = (uint8_t)(cmd[3] - '0');
+				if (level <= 9u) {
+					gEeprom.SQUELCH_LEVEL = level;
+					gFlagReconfigureVfos  = true;
+					gVfoConfigureMode     = VFO_CONFIGURE;
+				}
+			}
+		}
+		return;
+	}
+
+	// AG - AF gain / volume (AG0[000-255];)
+	if (cmd[0]=='A' && cmd[1]=='G') {
+		if (cmd[2]=='\0' || (cmd[2]=='0' && cmd[3]=='\0')) {
+			// read
+			buf[0]='A'; buf[1]='G'; buf[2]='0';
+			cat_fmt_uint(buf+3, gEeprom.VOLUME_GAIN, 3);
+			buf[6]=';';
+			cat_reply(buf, 7);
+		} else if (cmd[2]=='0' && cmd[3]!='\0') {
+			// write: AG0[3-digit value]
+			uint32_t val = 0;
+			for (uint8_t i = 0; i < 3; i++) {
+				if (cmd[3+i] < '0' || cmd[3+i] > '9') return;
+				val = val * 10u + (uint32_t)(cmd[3+i] - '0');
+			}
+			if (val > 255u) val = 255u;
+			gEeprom.VOLUME_GAIN = (uint8_t)val;
+		}
+		return;
+	}
+
+	// PC - TX power level (PC[3-digit]; maps LOW=005, MID=010, HIGH=050)
+	if (cmd[0]=='P' && cmd[1]=='C') {
+		if (cmd[2]=='\0') {
+			// read: map OUTPUT_POWER to approximate watts
+			static const uint16_t pc_watts[3] = {5u, 10u, 50u};
+			uint8_t pwr = gTxVfo->OUTPUT_POWER;
+			if (pwr > 2u) pwr = 2u;
+			buf[0]='P'; buf[1]='C';
+			cat_fmt_uint(buf+2, pc_watts[pwr], 3);
+			buf[5]=';';
+			cat_reply(buf, 6);
+		} else {
+			// write: set power level based on value
+			uint32_t val = 0;
+			for (uint8_t i = 0; i < 3; i++) {
+				if (cmd[2+i] < '0' || cmd[2+i] > '9') return;
+				val = val * 10u + (uint32_t)(cmd[2+i] - '0');
+			}
+			gTxVfo->OUTPUT_POWER = (val <= 7u)  ? OUTPUT_POWER_LOW  :
+			                       (val <= 25u) ? OUTPUT_POWER_MID  :
+			                                      OUTPUT_POWER_HIGH;
+			gFlagReconfigureVfos = true;
+			gVfoConfigureMode    = VFO_CONFIGURE;
+		}
+		return;
+	}
+
+	// RA - RF attenuator (stub — hardware has none, always return off)
+	if (cmd[0]=='R' && cmd[1]=='A') {
+		cat_reply("RA00;", 5);
+		return;
+	}
+
+	// VV - VFO A = VFO B (copy A into B)
+	if (cmd[0]=='V' && cmd[1]=='V' && cmd[2]=='\0') {
+		gEeprom.VfoInfo[1] = gEeprom.VfoInfo[0];
+		gEeprom.VfoInfo[1].pRX = &gEeprom.VfoInfo[1].freq_config_RX;
+		gEeprom.VfoInfo[1].pTX = &gEeprom.VfoInfo[1].freq_config_TX;
+		gFlagReconfigureVfos = true;
+		gVfoConfigureMode    = VFO_CONFIGURE;
+		return;
+	}
+
+	// Unknown command — reply with '?' so software doesn't hang waiting
+	cat_reply("?;", 2);
 }
 
 static void SendReply(void *pReply, uint16_t Size)
