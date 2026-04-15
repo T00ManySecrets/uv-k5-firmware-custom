@@ -200,21 +200,28 @@ static void cat_reply(const char *s, uint8_t len)
 	UART_Send(s, len);
 }
 
-// Parse 11 ASCII decimal digits starting at s into Hz, returns 0 on bad input
+// Parse 11 ASCII decimal digits starting at s into Hz, returns 0 on bad input.
+// Guard against uint32_t overflow: reject anything that would exceed 2 GHz
+// (well above the BK4819's 1300 MHz ceiling).
 static uint32_t cat_parse_freq(const char *s)
 {
 	uint32_t hz = 0;
 	for (uint8_t i = 0; i < 11; i++) {
 		if (s[i] < '0' || s[i] > '9')
 			return 0;
+		if (hz > 200000000u)   // 200 000 000 * 10 = 2 GHz — stop before overflow
+			return 0;
 		hz = hz * 10u + (uint32_t)(s[i] - '0');
 	}
 	return hz;
 }
 
-// Set VFO frequency (in 10 Hz units) and trigger retune
+// Set VFO frequency (in 10 Hz units) and trigger retune.
+// Rejects out-of-range frequencies using the same check the rest of the firmware uses.
 static void cat_set_vfo_freq(uint8_t vfo, uint32_t freq_10hz)
 {
+	if (freq_10hz == 0u || RX_freq_check(freq_10hz) != 0)
+		return; // out of band — ignore silently
 	gEeprom.VfoInfo[vfo].freq_config_RX.Frequency = freq_10hz;
 	gEeprom.VfoInfo[vfo].freq_config_TX.Frequency = freq_10hz;
 	gEeprom.VfoInfo[vfo].pRX = &gEeprom.VfoInfo[vfo].freq_config_RX;
@@ -247,11 +254,11 @@ static void HandleCATCommand(void)
 	}
 
 	// RX - return to receive
+	// Use gFlagEndTransmission only — lets the main loop run the proper TX teardown
+	// sequence (PA shutdown, CSS tail tones) rather than cutting power abruptly.
 	if (cmd[0]=='R' && cmd[1]=='X' && cmd[2]=='\0') {
-		if (gCurrentFunction == FUNCTION_TRANSMIT) {
+		if (gCurrentFunction == FUNCTION_TRANSMIT)
 			gFlagEndTransmission = true;
-			FUNCTION_Select(FUNCTION_FOREGROUND);
-		}
 		cat_reply("RX0;", 4);
 		return;
 	}
@@ -300,7 +307,9 @@ static void HandleCATCommand(void)
 			buf[2]=(char)('0' + cat_mod_to_cat(gTxVfo->Modulation));
 			buf[3]=';';
 			cat_reply(buf, 4);
-		} else {
+		} else if (gCurrentFunction != FUNCTION_TRANSMIT) {
+			// Guard: do not change modulation while transmitting — RF IC state
+			// must be consistent throughout a transmission.
 			RADIO_SetModulation(cat_cat_to_mod((uint8_t)(cmd[2] - '0')));
 			gFlagReconfigureVfos = true;
 			gVfoConfigureMode    = VFO_CONFIGURE;
